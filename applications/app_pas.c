@@ -142,7 +142,7 @@ void pas_event_handler(void) {
 	old_state = new_state;
 
 	// Require several quadrature events in the right direction to prevent vibrations from
-	// engging PAS
+	// engaging PAS
 	int8_t direction = (direction_conf * direction_qem);
 	
 	switch(direction) {

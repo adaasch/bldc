@@ -80,7 +80,7 @@
 /*
  * Set APP_CUSTOM_TO_USE to the name of the main C file of the custom application.
  */
-//#define APP_CUSTOM_TO_USE			"app_custom_template.c"
+#define APP_CUSTOM_TO_USE			"app_custom_pas.c"
 //#define APP_CUSTOM_TO_USE			"app_motor_heater.c"
 //#include "er/app_erockit_conf_v2.h"
 //#include "finn/app_finn_az_conf.h"
@@ -93,14 +93,14 @@
  * Enable blackmagic probe output on SWD port
  */
 #ifndef HAS_BLACKMAGIC
-#define HAS_BLACKMAGIC				1
+#define HAS_BLACKMAGIC				0
 #endif
 
 /*
  * Enable CAN-bus
  */
 #ifndef CAN_ENABLE
-#define CAN_ENABLE					1
+#define CAN_ENABLE					0
 #endif
 
 #ifdef HW_HAS_NO_CAN
