@@ -19,24 +19,91 @@
 #include "conf_general.h"
 
 #include "hw.h"
-#include "no2_display_serial.h"
 #include "app.h"
 #include "ch.h"
 #include "hal.h"
+
 #include "packet.h"
 #include "commands.h"
 #include "mc_interface.h"
 #include "utils.h"
+#include "terminal.h"
+#include "datatypes.h"
+
 #include <math.h>
 #include <string.h>
-#include "comm_can.h"
-#include "datatypes.h"
+#include <stdio.h>
+
+#include "no2_display_serial.h"
+
+struct rx_param
+{
+#define NO2_RX_MAGIC_NUM 0x011401
+	uint32_t magic_num : 24;	 // 0-2
+	uint8_t throttle_mode;		 // 3 P10
+	uint8_t assist_level;		 // 4
+	uint8_t unk0 : 1;			 // 5
+	uint8_t push_assist : 1;	 //
+	uint8_t comm_error : 1;		 //
+	uint8_t unk1 : 2;			 //
+	uint8_t headlight : 1;		 //
+	uint8_t zero_start : 1;		 // P09
+	uint8_t unk2 : 1;			 //
+	uint8_t motor_ratio;		 // 6   P07
+	uint16_t wheel_size_dIn;	 // 7,8 bs P06
+	uint8_t boost_power;		 // 9 P11
+	uint8_t start_delay_pas;	 // 10 P12
+	uint8_t unk3;				 // 11
+	uint8_t speed_limit_kmh;	 // 12 P08
+	uint8_t current_limit_A;	 // 13 P14
+	uint16_t voltage_min_dV;	 // 14,15 bs P15
+	uint16_t unk4;				 // 16,17
+	uint8_t num_pas_magnets : 4; // 18 P13
+	uint8_t unk5 : 2;			 //
+	uint8_t cruise_control : 1;	 // P17
+	uint8_t unk6 : 1;			 //
+	uint8_t crc;				 //
+} __attribute__((packed));
+#define NO2_RX_MSG_SIZE sizeof(struct rx_param)
+
+struct tx_param
+{
+#define NO2_TX_MAGIC_NUM 0x010e02
+	uint32_t magic_num : 24;   // 0-2
+	uint8_t e07 : 1;		   // 3
+	uint8_t ukn0 : 1;		   //
+	uint8_t push_assist : 1;   //
+	uint8_t e06 : 1;		   //
+	uint8_t e09 : 1;		   //
+	uint8_t ukn1 : 1;		   //
+	uint8_t e07_2 : 1;		   //
+	uint8_t push_assist_2 : 1; //
+	uint8_t ukn2 : 4;		   // 4
+	uint8_t e11 : 1;		   //
+	uint8_t brake : 1;		   //
+	uint8_t ukn3 : 2;		   //
+	uint8_t ukn4;			   // 5
+	uint16_t current_dA;	   // 6,7 bs
+	uint16_t wheel_period_ms;  // 8,9 bs
+	uint16_t ukn5;			   // 10,11
+	uint8_t ukn6;			   // 12
+	uint8_t crc;			   // 13
+} __attribute__((packed));
+#define NO2_TX_MSG_SIZE sizeof(struct tx_param)
+
+typedef struct
+{
+	struct rx_param rx;
+	struct tx_param tx;
+	systime_t last_msg;
+
+} no2_message_t;
 
 // Threads
 static THD_WORKING_AREA(display_process_thread_wa, 1024);
 static THD_FUNCTION(display_process_thread, arg);
 
-volatile No2_t no2_data[2];
+volatile no2_message_t no2_data[2];
 int new = 1;
 int old = 0;
 
@@ -51,8 +118,7 @@ int calculate_checksum(unsigned char *frame_buf, uint8_t length);
 uint8_t lowByte(uint16_t word);
 uint8_t highByte(uint16_t word);
 
-#define NO2_SERIAL_BUFFER_SIZE 60
-#define NO2_MSG_SIZE 20
+#define NO2_SERIAL_BUFFER_SIZE (3 * NO2_RX_MSG_SIZE)
 
 typedef struct
 {
@@ -83,7 +149,7 @@ void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_
 
 	commands_printf("Starting No 2 Display!");
 
-	memset(&no2_data, 0, sizeof(no2_data));
+	memset((void *)no2_data, 0, sizeof(no2_data));
 
 	if (!display_thread_is_running)
 	{
@@ -101,81 +167,57 @@ void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_
 	display_uart_is_running = true;
 }
 
-bool no2_display_serial_is_active()
+bool no2_display_serial_is_active(void)
 {
 	return ((chVTGetSystemTimeX() - no2_data[old].last_msg) / (float)CH_CFG_ST_FREQUENCY) < 1.0; // no msg since 1 sec
 }
 
 void no2_display_serial_set_wheel_rpm(float rpm)
 {
-	no2_data[new].Tx.Wheeltime_ms = 60 / rpm * 1000;
+	no2_data[new].tx.wheel_period_ms = __bswap16(60 / rpm * 1000);
 }
 
-int No2_Service(uint8_t *No2_Message)
+
+int No2_Service(uint8_t *msg)
 {
-	static uint8_t TxBuffer[14] = {0x2, 0x0E, 0x1, 0x0, 0x80, 0x0, 0x0, 0x2C, 0x0, 0xF9, 0x0, 0x0, 0xFF, 0xA};
+	// static uint8_t TxBuffer[14] = {0x2, 0x0E, 0x1, 0x0, 0x80, 0x0, 0x0, 0x2C, 0x0, 0xF9, 0x0, 0x0, 0xFF, 0xA};
+
+	struct rx_param *rx_msg = (struct rx_param *)msg;
 
 	// check alignment
-	int idx = 0;
-	while (!(No2_Message[idx] == 0x01 && No2_Message[idx + 1] == 0x14 && No2_Message[idx + 2] == 0x01))
+	unsigned int idx = 0;
+	while (rx_msg->magic_num != NO2_RX_MAGIC_NUM)
 	{
 		idx++;
-		if (idx > NO2_MSG_SIZE - 3)
+		if (idx > NO2_RX_MSG_SIZE - 3)
 			break; // Magic number not found
+		rx_msg = (struct rx_param *)(msg + idx);
 	}
 	if (idx > 0)
 		return idx; // discard bytes
 
-	if (No2_Message[19] == calculate_checksum(No2_Message, NO2_MSG_SIZE))
+	if (rx_msg->crc == calculate_checksum((uint8_t *)rx_msg, NO2_RX_MSG_SIZE))
 	{
 		// swap data
 		old = !old;
 		new = !new;
 
-		// to do bit indexing
-		no2_data[new].Rx.AssistLevel = No2_Message[4];
-		no2_data[new].Rx.NumberOfPasMagnets = No2_Message[18] & 0x0F;
-		no2_data[new].Rx.CUR_Limit_A = No2_Message[13];
-		no2_data[new].Rx.Voltage_min_x10 = (No2_Message[14] << 8) + No2_Message[15];
-		no2_data[new].Rx.WheelSizeInch_x10 = (No2_Message[7] << 8) + No2_Message[8];
-		no2_data[new].Rx.Throttle_mode = No2_Message[3];
-		no2_data[new].Rx.Start_delay_PAS = No2_Message[9];
-		no2_data[new].Rx.BoostPower = No2_Message[10];
-		no2_data[new].Rx.ZeroStart = (No2_Message[5] >> 6) & 0x01;
-		no2_data[new].Rx.Headlight = (No2_Message[5] >> 5) & 0x01;
-		no2_data[new].Rx.PushAssist = (No2_Message[5] >> 1) & 0x01;
-		no2_data[new].Rx.CruiseControl = (No2_Message[18] >> 6) & 0x01;
-		no2_data[new].Rx.SPEEDMAX_Limit = No2_Message[12];
-		no2_data[new].Rx.GearRatio = No2_Message[6];
-
+		no2_data[new].rx = *rx_msg;
 		no2_data[new].last_msg = chVTGetSystemTimeX();
 
-		TxBuffer[3] = no2_data[old].Tx.Error;
-		TxBuffer[4] = no2_data[old].Tx.BrakeActive << 5; // 0b00100000;
-		TxBuffer[6] = highByte(no2_data[old].Tx.Current_x10);
-		TxBuffer[7] = lowByte(no2_data[old].Tx.Current_x10);
-		TxBuffer[8] = highByte(no2_data[old].Tx.Wheeltime_ms);
-		TxBuffer[9] = lowByte(no2_data[old].Tx.Wheeltime_ms);
+		// send response
+		no2_data[old].tx.magic_num = NO2_TX_MAGIC_NUM;
 
-		TxBuffer[13] = calculate_checksum(TxBuffer, 14);
-		serial_send_packet(TxBuffer, sizeof(TxBuffer));
+
+		no2_data[old].tx.crc = calculate_checksum((uint8_t *)&(no2_data[old].tx), sizeof(no2_data[old].tx));
+		serial_send_packet((uint8_t *)&(no2_data[old].tx), sizeof(no2_data[old].tx));
 	}
 	else
 	{
 		commands_printf("process no2 CHECKSUM error!");
 	}
 
-	return NO2_MSG_SIZE;
-}
-
-uint8_t lowByte(uint16_t word)
-{
-	return word & 0xFF;
-}
-
-uint8_t highByte(uint16_t word)
-{
-	return word >> 8;
+	return NO2_RX_MSG_SIZE;
 }
 
 int calculate_checksum(unsigned char *frame_buf, uint8_t length)
@@ -206,8 +248,8 @@ static void serial_display_byte_process(unsigned char byte)
 	serial_buffer.data[serial_buffer.wr_ptr] = byte;
 	serial_buffer.wr_ptr++;
 
-	// process with at least NO2_MSG_SIZE bytes available to read
-	while ((serial_buffer.wr_ptr - serial_buffer.rd_ptr) >= NO2_MSG_SIZE)
+	// process with at least NO2_RX_MSG_SIZE bytes available to read
+	while ((serial_buffer.wr_ptr - serial_buffer.rd_ptr) >= NO2_RX_MSG_SIZE)
 	{
 
 		// commands_printf("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
@@ -268,14 +310,14 @@ static void serial_display_check_rx(void)
 	}
 }
 
-static propagate_changes()
+static void propagate_changes(void)
 {
-	if (no2_data[new].Rx.AssistLevel != no2_data[old].Rx.AssistLevel)
-		set_assist_level((no2_data[new].Rx.AssistLevel - 1) / 14.0);
+	if (no2_data[new].rx.assist_level != no2_data[old].rx.assist_level)
+		set_assist_level((no2_data[new].rx.assist_level) / 15.0);
 	// commands_printf("process no2 Assist lvl: %d ", no2_data[new].Rx.AssistLevel);
 
-	if (no2_data[new].Rx.Headlight != no2_data[old].Rx.Headlight)
-		set_head_light(no2_data[new].Rx.Headlight);
+	if (no2_data[new].rx.headlight != no2_data[old].rx.headlight)
+		set_head_light(no2_data[new].rx.headlight);
 }
 
 static THD_FUNCTION(display_process_thread, arg)
