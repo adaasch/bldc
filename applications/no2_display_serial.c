@@ -142,6 +142,9 @@ static no2_serial_buffer_t serial_buffer;
 static void (*set_assist_level)(float);
 static void (*set_head_light)(bool);
 
+static void debug_en(int argc, const char **argv);
+static void mod_tx(int argc, const char **argv);
+
 void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_cb)(bool))
 {
 	set_assist_level = assist_level_cb;
@@ -165,6 +168,18 @@ void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_
 	palSetPadMode(HW_UART_RX_PORT, HW_UART_RX_PIN, PAL_MODE_ALTERNATE(HW_UART_GPIO_AF) | PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
 
 	display_uart_is_running = true;
+
+	terminal_register_command_callback(
+		"no2_en_dbg",
+		"Enable debug.",
+		"[bool]",
+		debug_en);
+
+	terminal_register_command_callback(
+		"no2_mod_byte",
+		"mod tx byte.",
+		"[byte][bit]",
+		mod_tx);
 }
 
 bool no2_display_serial_is_active(void)
@@ -177,6 +192,9 @@ void no2_display_serial_set_wheel_rpm(float rpm)
 	no2_data[new].tx.wheel_period_ms = __bswap16(60 / rpm * 1000);
 }
 
+volatile int debug_enabled = 0;
+volatile uint8_t tx_pos = 20;
+volatile uint8_t tx_byte = 0;
 
 int No2_Service(uint8_t *msg)
 {
@@ -208,6 +226,14 @@ int No2_Service(uint8_t *msg)
 		// send response
 		no2_data[old].tx.magic_num = NO2_TX_MAGIC_NUM;
 
+		if (tx_pos < 20)
+		{
+			struct tx_param tmp = no2_data[old].tx;
+			((uint8_t *)&tmp)[tx_pos] = tx_byte;
+			no2_data[old].tx.crc = calculate_checksum((uint8_t *)&tmp, sizeof(tmp));
+			serial_send_packet((uint8_t *)&tmp, sizeof(tmp));
+			return NO2_RX_MSG_SIZE;
+		}
 
 		no2_data[old].tx.crc = calculate_checksum((uint8_t *)&(no2_data[old].tx), sizeof(no2_data[old].tx));
 		serial_send_packet((uint8_t *)&(no2_data[old].tx), sizeof(no2_data[old].tx));
@@ -228,7 +254,6 @@ int calculate_checksum(unsigned char *frame_buf, uint8_t length)
 	for (p = frame_buf; p < frame_buf + (length - 1); p++)
 	{
 		tmp = *p;
-		// printf("%d, %x\r\n ", p,tmp);
 		xor = xor ^ tmp;
 	}
 	return (xor);
@@ -242,37 +267,57 @@ static void serial_send_packet(unsigned char *data, unsigned int len)
 	}
 }
 
+void print_rx_param(const struct rx_param *param)
+{
+	commands_printf("RX Parameter Struct:");
+	commands_printf("---------------------");
+	commands_printf("Magic Number: 0x%06X", param->magic_num);
+	commands_printf("Throttle Mode: %u", param->throttle_mode);
+	commands_printf("Assist Level: %u", param->assist_level);
+	commands_printf("Unknown 0 (unk0): %u", param->unk0);
+	commands_printf("Push Assist: %u", param->push_assist);
+	commands_printf("Unknown 1 (unk1): 0b%03u", param->unk1);
+	commands_printf("Headlight: %u", param->headlight);
+	commands_printf("Zero Start: %u", param->zero_start);
+	commands_printf("Unknown 2 (unk2): %u", param->unk2);
+	commands_printf("Motor Ratio: %u", param->motor_ratio);
+	commands_printf("Wheel Size (dIn): %u", __bswap16(param->wheel_size_dIn));
+	commands_printf("Boost Power: %u", param->boost_power);
+	commands_printf("Start Delay PAS: %u", param->start_delay_pas);
+	commands_printf("Unknown 3 (unk3): %u", param->unk3);
+	commands_printf("Speed Limit (km/h): %u", param->speed_limit_kmh);
+	commands_printf("Current Limit (A): %u", param->current_limit_A);
+	commands_printf("Voltage Min (dV): %u", __bswap16(param->voltage_min_dV));
+	commands_printf("Unknown 4 (unk4): %u", param->unk4);
+	commands_printf("Number of PAS Magnets: %u", param->num_pas_magnets);
+	commands_printf("Unknown 5 (unk5): 0b%02u", param->unk5);
+	commands_printf("Cruise Control: %u", param->cruise_control);
+	commands_printf("Unknown 6 (unk6): %u", param->unk6);
+	commands_printf("CRC: 0x%02X", param->crc);
+	commands_printf("---------------------");
+}
+
 static void serial_display_byte_process(unsigned char byte)
 {
 	// append new byte to the buffer.
 	serial_buffer.data[serial_buffer.wr_ptr] = byte;
 	serial_buffer.wr_ptr++;
 
+	uint8_t last_buf[NO2_RX_MSG_SIZE];
+
 	// process with at least NO2_RX_MSG_SIZE bytes available to read
 	while ((serial_buffer.wr_ptr - serial_buffer.rd_ptr) >= NO2_RX_MSG_SIZE)
 	{
-
-		// commands_printf("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-		// 				serial_buffer.data[serial_buffer.rd_ptr],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 1],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 2],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 3],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 4],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 5],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 6],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 7],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 8],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 9],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 10],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 11],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 12],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 13],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 14],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 15],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 16],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 17],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 18],
-		// 				serial_buffer.data[serial_buffer.rd_ptr + 19]);
+		if (debug_enabled)
+		{
+			int n = memcmp(last_buf, &serial_buffer.data[serial_buffer.rd_ptr], NO2_RX_MSG_SIZE);
+			if (n)
+			{
+				commands_printf("Difference at byte %d", n);
+				print_rx_param((const struct rx_param *)&serial_buffer.data[serial_buffer.rd_ptr]);
+				memcpy(last_buf, &serial_buffer.data[serial_buffer.rd_ptr], NO2_RX_MSG_SIZE);
+			}
+		}
 
 		serial_buffer.rd_ptr += No2_Service(&serial_buffer.data[serial_buffer.rd_ptr]);
 	}
@@ -341,5 +386,30 @@ static THD_FUNCTION(display_process_thread, arg)
 		chEvtWaitAnyTimeout(ALL_EVENTS, ST2MS(100));
 		serial_display_check_rx();
 		propagate_changes();
+	}
+}
+
+static void debug_en(int argc, const char **argv)
+{
+	if (argc == 2)
+	{
+		sscanf(argv[1], "%d", &debug_enabled);
+	}
+	else
+	{
+		commands_printf("This command requires two arguments.");
+	}
+}
+
+static void mod_tx(int argc, const char **argv)
+{
+	if (argc == 3)
+	{
+		sscanf(argv[1], "%hhu", &tx_pos);
+		sscanf(argv[2], "%hhu", &tx_byte);
+	}
+	else
+	{
+		commands_printf("This command requires two arguments.");
 	}
 }
