@@ -44,6 +44,8 @@ static THD_WORKING_AREA(my_thread_wa, 1024);
 // Private functions
 static void assist_level_callback(float rel_current);
 static void head_light_callback(bool on);
+static void push_assist_callback(void);
+static void pas_params_callback(uint8_t coarse, uint8_t fine);
 static void pas_conf(int argc, const char **argv);
 
 // Private variables
@@ -53,8 +55,8 @@ static volatile bool is_running = false;
 // PAS
 static volatile float current_assist_level = 0.0;
 static volatile bool pas_enabled = false;
-static volatile float pas_threshold = 0.7;
-static volatile float pas_filter_loss = 0.5;
+static volatile float pas_threshold = 0.3;
+static volatile float pas_filter_loss = 0.05;
 
 // CH_IRQ_HANDLER(HW_ENC_EXTI_ISR_VEC) {
 // 	if (EXTI_GetITStatus(HW_ENC_EXTI_LINE) != RESET) {
@@ -92,7 +94,7 @@ void app_custom_start(void)
 	chThdCreateStatic(my_thread_wa, sizeof(my_thread_wa),
 					  NORMALPRIO, my_thread, NULL);
 
-	no2_display_serial_start(assist_level_callback, head_light_callback);
+	no2_display_serial_start(assist_level_callback, head_light_callback, push_assist_callback, pas_params_callback);
 
 	volatile mc_configuration *conf = mc_interface_get_configuration();
 	conf->l_max_erpm = 10e3; // ERPM limits 10k ~ 27km/h
@@ -282,7 +284,7 @@ static void pas_conf(int argc, const char **argv)
 	}
 	else
 	{
-		commands_printf("Current: Threshold: %.2f V Filter: %.2f",
+		commands_printf("Current: Threshold: %.2f V Filter: %.3f",
 						pas_threshold, pas_filter_loss);
 		commands_printf("This command requires two arguments.\n");
 	}
@@ -299,7 +301,19 @@ void head_light_callback(bool on)
 {
 	volatile mc_configuration *conf = mc_interface_get_configuration();
 	if (on)
-		conf->l_max_erpm = 20e3; 
+		conf->l_max_erpm = 50e3;
 	else
 		conf->l_max_erpm = 10e3; // ERPM limits 10k ~ 27km/h
+}
+
+void push_assist_callback(void)
+{
+}
+
+void pas_params_callback(uint8_t coarse, uint8_t fine)
+{
+	pas_threshold = 1.0 / 6 * (coarse + 1);
+	pas_filter_loss = fine / 24.0 / 10.0;
+	commands_printf("New: Threshold: %.2f V Filter: %.3f",
+					pas_threshold, pas_filter_loss);
 }

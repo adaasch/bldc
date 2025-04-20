@@ -1,6 +1,5 @@
 /*
-	Copyright 2021 Marcos Chaparro	mchaparro@powerdesigns.ca
-	Copyright 2021 Maximiliano Cordoba	mcordoba@powerdesigns.ca
+	Copyright 2025 Andreas Daasch
 
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -36,11 +35,13 @@
 
 #include "no2_display_serial.h"
 
+// private types
+
 struct rx_param
 {
 #define NO2_RX_MAGIC_NUM 0x011401
 	uint32_t magic_num : 24;	 // 0-2
-	uint8_t throttle_mode;		 // 3 P10
+	uint8_t throttle_mode;		 // 3 P10 (0-2)
 	uint8_t assist_level;		 // 4
 	uint8_t unk0 : 1;			 // 5
 	uint8_t push_assist : 1;	 //
@@ -49,16 +50,16 @@ struct rx_param
 	uint8_t headlight : 1;		 //
 	uint8_t zero_start : 1;		 // P09
 	uint8_t unk2 : 1;			 //
-	uint8_t motor_ratio;		 // 6   P07
-	uint16_t wheel_size_dIn;	 // 7,8 bs P06
-	uint8_t boost_power;		 // 9 P11
-	uint8_t start_delay_pas;	 // 10 P12
+	uint8_t motor_ratio;		 // 6 P07
+	uint16_t wheel_size_dIn;	 // 7,8 byteswap P06
+	uint8_t pas_sensitivity;	 // 9 P11 (1-24)
+	uint8_t pas_attack;			 // 10 P12 (0-5)
 	uint8_t unk3;				 // 11
-	uint8_t speed_limit_kmh;	 // 12 P08
-	uint8_t current_limit_A;	 // 13 P14
-	uint16_t voltage_min_dV;	 // 14,15 bs P15
+	uint8_t speed_limit_kmh;	 // 12 P08 (0-100)
+	uint8_t current_limit_A;	 // 13 P14 (1-20)
+	uint16_t voltage_min_dV;	 // 14,15 byteswap P15
 	uint16_t unk4;				 // 16,17
-	uint8_t num_pas_magnets : 4; // 18 P13
+	uint8_t num_pas_magnets : 4; // 18 P13 (5,8,12)
 	uint8_t unk5 : 2;			 //
 	uint8_t cruise_control : 1;	 // P17
 	uint8_t unk6 : 1;			 //
@@ -83,8 +84,8 @@ struct tx_param
 	uint8_t brake : 1;		   //
 	uint8_t ukn3 : 2;		   //
 	uint8_t ukn4;			   // 5
-	uint16_t current_dA;	   // 6,7 bs
-	uint16_t wheel_period_ms;  // 8,9 bs
+	uint16_t current_dA;	   // 6,7 byteswap
+	uint16_t wheel_period_ms;  // 8,9 byteswap
 	uint16_t ukn5;			   // 10,11
 	uint8_t ukn6;			   // 12
 	uint8_t crc;			   // 13
@@ -93,30 +94,11 @@ struct tx_param
 
 typedef struct
 {
-	struct rx_param rx;
+	struct rx_param rx[2];
 	struct tx_param tx;
 	systime_t last_msg;
 
 } no2_message_t;
-
-// Threads
-static THD_WORKING_AREA(display_process_thread_wa, 1024);
-static THD_FUNCTION(display_process_thread, arg);
-
-volatile no2_message_t no2_data[2];
-int new = 1;
-int old = 0;
-
-static void serial_send_packet(unsigned char *data, unsigned int len);
-static void serial_display_byte_process(unsigned char byte);
-static void serial_display_check_rx(void);
-
-int No2_Service(uint8_t *No2_Message);
-
-int calculate_checksum(unsigned char *frame_buf, uint8_t length);
-
-uint8_t lowByte(uint16_t word);
-uint8_t highByte(uint16_t word);
 
 #define NO2_SERIAL_BUFFER_SIZE (3 * NO2_RX_MSG_SIZE)
 
@@ -127,32 +109,72 @@ typedef struct
 	unsigned char data[NO2_SERIAL_BUFFER_SIZE];
 } no2_serial_buffer_t;
 
+// Threads
+static THD_WORKING_AREA(display_process_thread_wa, 1024);
+static THD_FUNCTION(display_process_thread, arg);
+
+// private variables
+
+static volatile no2_message_t no2_data;
+static volatile int current_rx_idx = 1;
+static volatile int last_rx_idx = 0;
+
 static volatile bool display_thread_is_running = false;
 static volatile bool display_uart_is_running = false;
-
-/* UART driver configuration structure */
-static SerialConfig uart_cfg = {
-	9600, // baud rate
-	0,
-	USART_CR2_LINEN,
-	0};
-
 static no2_serial_buffer_t serial_buffer;
 
+// call backs
 static void (*set_assist_level)(float);
 static void (*set_head_light)(bool);
+static void (*request_push_assist)(void);
+static void (*set_pas_params)(uint8_t, uint8_t);
 
-static void debug_en(int argc, const char **argv);
-static void mod_tx(int argc, const char **argv);
+// debug
 
-void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_cb)(bool))
+static volatile int debug_enabled = 0;
+static volatile uint8_t tx_pos = 20;
+static volatile uint8_t tx_byte = 0;
+
+// function definitions
+
+static void debug_en(int argc, const char **argv)
 {
+	if (argc == 2)
+	{
+		sscanf(argv[1], "%d", &debug_enabled);
+	}
+	else
+	{
+		commands_printf("This command requires one argument.");
+	}
+}
+
+static void mod_tx(int argc, const char **argv)
+{
+	if (argc == 3)
+	{
+		sscanf(argv[1], "%hhu", &tx_pos);
+		sscanf(argv[2], "%hhu", &tx_byte);
+	}
+	else
+	{
+		commands_printf("This command requires two arguments.");
+	}
+}
+
+void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_cb)(bool), void (*push_assist_cb)(void),
+							  void (*pas_params_cb)(uint8_t, uint8_t))
+{
+	commands_printf("Starting No 2 Display Driver!");
+
 	set_assist_level = assist_level_cb;
 	set_head_light = head_light_cb;
+	request_push_assist = push_assist_cb;
+	set_pas_params = pas_params_cb;
 
-	commands_printf("Starting No 2 Display!");
-
-	memset((void *)no2_data, 0, sizeof(no2_data));
+	// init messages
+	memset((void *)no2_data.rx, 0, sizeof(no2_data.rx));
+	no2_data.tx.magic_num = NO2_TX_MAGIC_NUM;
 
 	if (!display_thread_is_running)
 	{
@@ -163,11 +185,21 @@ void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_
 	serial_buffer.rd_ptr = 0;
 	serial_buffer.wr_ptr = 0;
 
+	// config uart
+
+	static const SerialConfig uart_cfg = {
+		9600, // baud rate
+		0,
+		USART_CR2_LINEN,
+		0};
+
 	sdStart(&HW_UART_DEV, &uart_cfg);
 	palSetPadMode(HW_UART_TX_PORT, HW_UART_TX_PIN, PAL_MODE_ALTERNATE(HW_UART_GPIO_AF) | PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
 	palSetPadMode(HW_UART_RX_PORT, HW_UART_RX_PIN, PAL_MODE_ALTERNATE(HW_UART_GPIO_AF) | PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
 
 	display_uart_is_running = true;
+
+	// debug stuff
 
 	terminal_register_command_callback(
 		"no2_en_dbg",
@@ -178,28 +210,83 @@ void no2_display_serial_start(void (*assist_level_cb)(float), void (*head_light_
 	terminal_register_command_callback(
 		"no2_mod_byte",
 		"mod tx byte.",
-		"[byte][bit]",
+		"[byte][value]",
 		mod_tx);
 }
 
 bool no2_display_serial_is_active(void)
 {
-	return ((chVTGetSystemTimeX() - no2_data[old].last_msg) / (float)CH_CFG_ST_FREQUENCY) < 1.0; // no msg since 1 sec
+	return ((chVTGetSystemTimeX() - no2_data.last_msg) / (float)CH_CFG_ST_FREQUENCY) < 1.0; // no msg since 1 sec
 }
 
 void no2_display_serial_set_wheel_rpm(float rpm)
 {
-	no2_data[new].tx.wheel_period_ms = __bswap16(60 / rpm * 1000);
+	no2_data.tx.wheel_period_ms = __bswap16(60 / rpm * 1000);
 }
 
-volatile int debug_enabled = 0;
-volatile uint8_t tx_pos = 20;
-volatile uint8_t tx_byte = 0;
-
-int No2_Service(uint8_t *msg)
+void no2_display_serial_set_current(float current)
 {
-	// static uint8_t TxBuffer[14] = {0x2, 0x0E, 0x1, 0x0, 0x80, 0x0, 0x0, 0x2C, 0x0, 0xF9, 0x0, 0x0, 0xFF, 0xA};
+	no2_data.tx.wheel_period_ms = __bswap16(current * 10);
+}
 
+void no2_display_serial_set_push_assist(bool active)
+{
+	no2_data.tx.push_assist = active;
+}
+
+void no2_display_serial_set_brake(bool active)
+{
+	no2_data.tx.brake = active;
+}
+
+void no2_display_serial_set_error(int error)
+{
+	switch (error)
+	{
+	case NO2_ERROR_E06:
+		no2_data.tx.e06 = 1;
+		break;
+	case NO2_ERROR_E07:
+		no2_data.tx.e07 = 1;
+		break;
+	case NO2_ERROR_E09:
+		no2_data.tx.e09 = 1;
+		break;
+	case NO2_ERROR_E11:
+		no2_data.tx.e11 = 1;
+		break;
+	default:
+		no2_data.tx.e06 = 0;
+		no2_data.tx.e07 = 0;
+		no2_data.tx.e09 = 0;
+		no2_data.tx.e11 = 0;
+		break;
+	}
+}
+
+static int calculate_checksum(unsigned char *frame_buf, uint8_t length)
+{
+	unsigned char xor = 0;
+	unsigned char *p;
+	unsigned char tmp;
+	for (p = frame_buf; p < frame_buf + (length - 1); p++)
+	{
+		tmp = *p;
+		xor = xor ^ tmp;
+	}
+	return (xor);
+}
+
+static void send_packet(unsigned char *data, unsigned int len)
+{
+	if (display_uart_is_running)
+	{
+		sdWrite(&HW_UART_DEV, data, len);
+	}
+}
+
+static int parse_message(uint8_t *msg)
+{
 	struct rx_param *rx_msg = (struct rx_param *)msg;
 
 	// check alignment
@@ -217,57 +304,34 @@ int No2_Service(uint8_t *msg)
 	if (rx_msg->crc == calculate_checksum((uint8_t *)rx_msg, NO2_RX_MSG_SIZE))
 	{
 		// swap data
-		old = !old;
-		new = !new;
+		last_rx_idx = !last_rx_idx;
+		current_rx_idx = !current_rx_idx;
 
-		no2_data[new].rx = *rx_msg;
-		no2_data[new].last_msg = chVTGetSystemTimeX();
+		no2_data.rx[current_rx_idx] = *rx_msg;
+		no2_data.last_msg = chVTGetSystemTimeX();
 
 		// send response
-		no2_data[old].tx.magic_num = NO2_TX_MAGIC_NUM;
-
 		if (tx_pos < 20)
 		{
-			struct tx_param tmp = no2_data[old].tx;
+			struct tx_param tmp = no2_data.tx;
 			((uint8_t *)&tmp)[tx_pos] = tx_byte;
-			no2_data[old].tx.crc = calculate_checksum((uint8_t *)&tmp, sizeof(tmp));
-			serial_send_packet((uint8_t *)&tmp, sizeof(tmp));
+			no2_data.tx.crc = calculate_checksum((uint8_t *)&tmp, sizeof(tmp));
+			send_packet((uint8_t *)&tmp, sizeof(tmp));
 			return NO2_RX_MSG_SIZE;
 		}
 
-		no2_data[old].tx.crc = calculate_checksum((uint8_t *)&(no2_data[old].tx), sizeof(no2_data[old].tx));
-		serial_send_packet((uint8_t *)&(no2_data[old].tx), sizeof(no2_data[old].tx));
+		no2_data.tx.crc = calculate_checksum((uint8_t *)&(no2_data.tx), sizeof(no2_data.tx));
+		send_packet((uint8_t *)&(no2_data.tx), sizeof(no2_data.tx));
 	}
 	else
 	{
-		commands_printf("process no2 CHECKSUM error!");
+		commands_printf("No2 Display: CHECKSUM error in rx message!");
 	}
 
 	return NO2_RX_MSG_SIZE;
 }
 
-int calculate_checksum(unsigned char *frame_buf, uint8_t length)
-{
-	unsigned char xor = 0;
-	unsigned char *p;
-	unsigned char tmp;
-	for (p = frame_buf; p < frame_buf + (length - 1); p++)
-	{
-		tmp = *p;
-		xor = xor ^ tmp;
-	}
-	return (xor);
-}
-
-static void serial_send_packet(unsigned char *data, unsigned int len)
-{
-	if (display_uart_is_running)
-	{
-		sdWrite(&HW_UART_DEV, data, len);
-	}
-}
-
-void print_rx_param(const struct rx_param *param)
+static void print_rx_param(const struct rx_param *param)
 {
 	commands_printf("RX Parameter Struct:");
 	commands_printf("---------------------");
@@ -276,28 +340,28 @@ void print_rx_param(const struct rx_param *param)
 	commands_printf("Assist Level: %u", param->assist_level);
 	commands_printf("Unknown 0 (unk0): %u", param->unk0);
 	commands_printf("Push Assist: %u", param->push_assist);
-	commands_printf("Unknown 1 (unk1): 0b%03u", param->unk1);
+	commands_printf("Unknown 1 (unk1): 0x%x", param->unk1);
 	commands_printf("Headlight: %u", param->headlight);
 	commands_printf("Zero Start: %u", param->zero_start);
 	commands_printf("Unknown 2 (unk2): %u", param->unk2);
 	commands_printf("Motor Ratio: %u", param->motor_ratio);
 	commands_printf("Wheel Size (dIn): %u", __bswap16(param->wheel_size_dIn));
-	commands_printf("Boost Power: %u", param->boost_power);
-	commands_printf("Start Delay PAS: %u", param->start_delay_pas);
+	commands_printf("Boost Power: %u", param->pas_sensitivity);
+	commands_printf("Start Delay PAS: %u", param->pas_attack);
 	commands_printf("Unknown 3 (unk3): %u", param->unk3);
 	commands_printf("Speed Limit (km/h): %u", param->speed_limit_kmh);
 	commands_printf("Current Limit (A): %u", param->current_limit_A);
 	commands_printf("Voltage Min (dV): %u", __bswap16(param->voltage_min_dV));
 	commands_printf("Unknown 4 (unk4): %u", param->unk4);
 	commands_printf("Number of PAS Magnets: %u", param->num_pas_magnets);
-	commands_printf("Unknown 5 (unk5): 0b%02u", param->unk5);
+	commands_printf("Unknown 5 (unk5): 0x%x", param->unk5);
 	commands_printf("Cruise Control: %u", param->cruise_control);
 	commands_printf("Unknown 6 (unk6): %u", param->unk6);
 	commands_printf("CRC: 0x%02X", param->crc);
 	commands_printf("---------------------");
 }
 
-static void serial_display_byte_process(unsigned char byte)
+static void write_to_buffer(unsigned char byte)
 {
 	// append new byte to the buffer.
 	serial_buffer.data[serial_buffer.wr_ptr] = byte;
@@ -319,7 +383,7 @@ static void serial_display_byte_process(unsigned char byte)
 			}
 		}
 
-		serial_buffer.rd_ptr += No2_Service(&serial_buffer.data[serial_buffer.rd_ptr]);
+		serial_buffer.rd_ptr += parse_message(&serial_buffer.data[serial_buffer.rd_ptr]);
 	}
 
 	if (serial_buffer.rd_ptr > 0)
@@ -336,7 +400,7 @@ static void serial_display_byte_process(unsigned char byte)
 	}
 }
 
-static void serial_display_check_rx(void)
+static void receive_byte(void)
 {
 	bool rx = true;
 	while (rx)
@@ -348,7 +412,7 @@ static void serial_display_check_rx(void)
 			msg_t res = sdGetTimeout(&HW_UART_DEV, TIME_IMMEDIATE);
 			if (res != MSG_TIMEOUT)
 			{
-				serial_display_byte_process(res);
+				write_to_buffer(res);
 				rx = true;
 			}
 		}
@@ -357,12 +421,18 @@ static void serial_display_check_rx(void)
 
 static void propagate_changes(void)
 {
-	if (no2_data[new].rx.assist_level != no2_data[old].rx.assist_level)
-		set_assist_level((no2_data[new].rx.assist_level) / 15.0);
-	// commands_printf("process no2 Assist lvl: %d ", no2_data[new].Rx.AssistLevel);
+	if (no2_data.rx[current_rx_idx].assist_level != no2_data.rx[last_rx_idx].assist_level)
+		set_assist_level((no2_data.rx[current_rx_idx].assist_level) / 15.0);
 
-	if (no2_data[new].rx.headlight != no2_data[old].rx.headlight)
-		set_head_light(no2_data[new].rx.headlight);
+	if (no2_data.rx[current_rx_idx].headlight != no2_data.rx[last_rx_idx].headlight)
+		set_head_light(no2_data.rx[current_rx_idx].headlight);
+
+	if (no2_data.rx[current_rx_idx].push_assist == 1)
+		request_push_assist();
+
+	if (no2_data.rx[current_rx_idx].pas_attack != no2_data.rx[last_rx_idx].pas_attack ||
+		no2_data.rx[current_rx_idx].pas_sensitivity != no2_data.rx[last_rx_idx].pas_sensitivity)
+		set_pas_params(no2_data.rx[current_rx_idx].pas_attack, no2_data.rx[current_rx_idx].pas_sensitivity);
 }
 
 static THD_FUNCTION(display_process_thread, arg)
@@ -379,37 +449,10 @@ static THD_FUNCTION(display_process_thread, arg)
 	// Set default power level
 	set_assist_level(0);
 
-	commands_printf("Starting No 2 Display Thread!");
-
 	for (;;)
 	{
 		chEvtWaitAnyTimeout(ALL_EVENTS, ST2MS(100));
-		serial_display_check_rx();
+		receive_byte();
 		propagate_changes();
-	}
-}
-
-static void debug_en(int argc, const char **argv)
-{
-	if (argc == 2)
-	{
-		sscanf(argv[1], "%d", &debug_enabled);
-	}
-	else
-	{
-		commands_printf("This command requires two arguments.");
-	}
-}
-
-static void mod_tx(int argc, const char **argv)
-{
-	if (argc == 3)
-	{
-		sscanf(argv[1], "%hhu", &tx_pos);
-		sscanf(argv[2], "%hhu", &tx_byte);
-	}
-	else
-	{
-		commands_printf("This command requires two arguments.");
 	}
 }
