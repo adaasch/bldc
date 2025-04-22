@@ -15,21 +15,11 @@
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 	*/
 
-#include "conf_general.h"
-
-#include "hw.h"
-#include "app.h"
-#include "ch.h"
 #include "hal.h"
 
-#include "packet.h"
 #include "commands.h"
-#include "mc_interface.h"
-#include "utils.h"
 #include "terminal.h"
-#include "datatypes.h"
 
-#include <math.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -106,7 +96,7 @@ typedef struct
 {
 	unsigned int rd_ptr;
 	unsigned int wr_ptr;
-	unsigned char data[NO2_SERIAL_BUFFER_SIZE];
+	uint8_t data[NO2_SERIAL_BUFFER_SIZE];
 } no2_serial_buffer_t;
 
 // Threads
@@ -132,8 +122,8 @@ static void (*set_pas_params)(uint8_t, uint8_t);
 // debug
 
 static volatile int debug_enabled = 0;
-static volatile uint8_t tx_pos = 20;
-static volatile uint8_t tx_byte = 0;
+static volatile uint8_t debug_tx_pos = 20;
+static volatile uint8_t debug_tx_byte = 0;
 
 // function definitions
 
@@ -153,8 +143,8 @@ static void mod_tx(int argc, const char **argv)
 {
 	if (argc == 3)
 	{
-		sscanf(argv[1], "%hhu", &tx_pos);
-		sscanf(argv[2], "%hhu", &tx_byte);
+		sscanf(argv[1], "%hhu", &debug_tx_pos);
+		sscanf(argv[2], "%hhu", &debug_tx_byte);
 	}
 	else
 	{
@@ -226,7 +216,7 @@ void no2_display_serial_set_wheel_rpm(float rpm)
 
 void no2_display_serial_set_current(float current)
 {
-	no2_data.tx.wheel_period_ms = __bswap16(current * 10);
+	no2_data.tx.current_dA = __bswap16(current * 10);
 }
 
 void no2_display_serial_set_push_assist(bool active)
@@ -264,20 +254,18 @@ void no2_display_serial_set_error(int error)
 	}
 }
 
-static int calculate_checksum(unsigned char *frame_buf, uint8_t length)
+static int calculate_checksum(uint8_t *frame_buf, uint8_t length)
 {
-	unsigned char xor = 0;
-	unsigned char *p;
-	unsigned char tmp;
-	for (p = frame_buf; p < frame_buf + (length - 1); p++)
+	uint8_t xor = 0;
+	for (uint8_t *p = frame_buf; p < frame_buf + (length - 1); p++)
 	{
-		tmp = *p;
+		uint8_t tmp = *p;
 		xor = xor ^ tmp;
 	}
-	return (xor);
+	return xor;
 }
 
-static void send_packet(unsigned char *data, unsigned int len)
+static void send_packet(uint8_t *data, unsigned int len)
 {
 	if (display_uart_is_running)
 	{
@@ -311,10 +299,10 @@ static int parse_message(uint8_t *msg)
 		no2_data.last_msg = chVTGetSystemTimeX();
 
 		// send response
-		if (tx_pos < 20)
+		if (debug_tx_pos < 20)
 		{
 			struct tx_param tmp = no2_data.tx;
-			((uint8_t *)&tmp)[tx_pos] = tx_byte;
+			((uint8_t *)&tmp)[debug_tx_pos] = debug_tx_byte;
 			no2_data.tx.crc = calculate_checksum((uint8_t *)&tmp, sizeof(tmp));
 			send_packet((uint8_t *)&tmp, sizeof(tmp));
 			return NO2_RX_MSG_SIZE;
@@ -361,7 +349,7 @@ static void print_rx_param(const struct rx_param *param)
 	commands_printf("---------------------");
 }
 
-static void write_to_buffer(unsigned char byte)
+static void write_to_buffer(uint8_t byte)
 {
 	// append new byte to the buffer.
 	serial_buffer.data[serial_buffer.wr_ptr] = byte;
